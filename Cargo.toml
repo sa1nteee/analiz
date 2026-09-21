@@ -1,0 +1,24 @@
+[package]
+name = "netsentry"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Network traffic analysis toolkit"
+license = "MIT"
+publish = false
+
+[dependencies]
+# FFI bindings to libpcap (Linux/macOS) and Npcap (Windows). Provides interface
+# enumeration, live capture and pcap file access behind one portable API.
+pcap = "2.5.0"
+
+# Command line argument parsing, --help generation and input validation.
+clap = { version = "4.6.7", features = ["derive"] }
+
+# Derive macro for std::error::Error, so every failure carries a typed source
+# chain instead of a stringly-typed message.
+thiserror = "2.0.20"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
