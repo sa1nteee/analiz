@@ -1,15 +1,10 @@
-//! Terminal rendering.
-//!
-//! Every function here is pure: data in, [`String`] out. Nothing touches the
-//! network, the filesystem or stdout. That makes the whole presentation layer
-//! unit testable, and means the same data can later be rendered as JSON or
-//! handed to a UI without rewriting anything.
+//! Rendering the interface listing.
 
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
 use crate::capture::{InterfaceAddress, NetworkInterface};
-use crate::error::NetSentryError;
+use crate::render::sanitize_display_text;
 
 /// Indentation of an interface's detail lines.
 const INDENT: &str = "    ";
@@ -45,12 +40,21 @@ pub fn interface_list(interfaces: &[NetworkInterface]) -> String {
 /// must pass back to the tool would be a usability bug.
 fn interface_block(interface: &NetworkInterface) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "[{}] {}", interface.index, interface.name);
+    let _ = writeln!(
+        out,
+        "[{}] {}",
+        interface.index,
+        sanitize_display_text(&interface.name)
+    );
 
     detail(
         &mut out,
         "description",
-        interface.description.as_deref().unwrap_or("(none)"),
+        &interface
+            .description
+            .as_deref()
+            .map(sanitize_display_text)
+            .unwrap_or_else(|| "(none)".to_owned()),
     );
 
     let attributes = interface
@@ -123,31 +127,6 @@ pub fn netmask_to_prefix_len(netmask: IpAddr) -> Option<u32> {
     // Everything after the prefix must be zero for the mask to be contiguous.
     let remainder = aligned.checked_shl(prefix).unwrap_or(0);
     if remainder == 0 { Some(prefix) } else { None }
-}
-
-/// Renders a failure as *what happened*, *why*, and *what to do about it*.
-///
-/// A security tool is only useful if the person running it can tell the
-/// difference between "there is nothing to see" and "I could not look", so
-/// every failure is reported with its full source chain rather than a single
-/// summarised line.
-pub fn error_report(error: &NetSentryError) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "error: {error}");
-
-    // Walk the source chain so the driver's own wording is never swallowed.
-    let mut source = std::error::Error::source(error);
-    while let Some(cause) = source {
-        let _ = writeln!(out, "cause: {cause}");
-        source = cause.source();
-    }
-
-    for (position, hint) in error.hints().iter().enumerate() {
-        let label = if position == 0 { "hint: " } else { "      " };
-        let _ = writeln!(out, "{label} {hint}");
-    }
-
-    out
 }
 
 /// "1 interface" / "4 interfaces" — English pluralisation for the summary line.
@@ -290,40 +269,29 @@ mod tests {
     }
 
     #[test]
-    fn error_report_states_what_why_and_next_step() {
-        let report = error_report(&NetSentryError::InterfaceEnumeration {
-            source: pcap::Error::PcapError("socket: Operation not permitted".into()),
-        });
-
-        assert!(report.starts_with("error: could not enumerate network interfaces\n"));
-        assert!(report.contains("cause: "));
-        assert!(report.contains("Operation not permitted"));
-        assert!(report.contains("hint: "));
-        assert!(report.ends_with('\n'));
-    }
-
-    #[test]
-    fn error_report_indents_continuation_hints() {
-        let report = error_report(&NetSentryError::NoInterfacesFound);
-        let hint_lines: Vec<&str> = report
-            .lines()
-            .filter(|line| line.starts_with("hint: ") || line.starts_with("      "))
-            .collect();
-
-        assert_eq!(
-            hint_lines.len(),
-            NetSentryError::NoInterfacesFound.hints().len()
-        );
-        assert!(hint_lines[0].starts_with("hint: "));
-        for line in &hint_lines[1..] {
-            assert!(line.starts_with("      "), "unaligned hint: {line:?}");
-        }
-    }
-
-    #[test]
     fn summary_line_pluralises() {
         assert_eq!(count_phrase(0), "0 interfaces");
         assert_eq!(count_phrase(1), "1 interface");
         assert_eq!(count_phrase(4), "4 interfaces");
+    }
+
+    #[test]
+    fn control_characters_from_the_driver_are_neutralised() {
+        // A description carrying an ANSI escape sequence must not be able to
+        // repaint the terminal.
+        let interface = NetworkInterface {
+            index: 1,
+            name: "eth0\u{1b}[2J".into(),
+            description: Some("Realtek\u{1b}[2J\u{7}NIC".into()),
+            status: LinkStatus::Down,
+            attributes: vec![],
+            addresses: vec![],
+        };
+        let block = interface_block(&interface);
+
+        assert!(!block.contains('\u{1b}'), "escape survived: {block:?}");
+        assert!(!block.contains('\u{7}'));
+        assert!(block.contains("Realtek") && block.contains("NIC"));
+        assert!(block.contains("eth0"));
     }
 }

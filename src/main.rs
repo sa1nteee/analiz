@@ -5,35 +5,70 @@
 //! failure is worded — lives in the `netsentry` library crate, so that a future
 //! desktop front end can reuse it instead of reimplementing it.
 
+use std::io::Write as _;
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use netsentry::cli::{Cli, Command};
+use netsentry::capture::{self, CaptureSettings, LiveCapture};
+use netsentry::cli::{CaptureArgs, Cli, Command};
+use netsentry::error::NetSentryError;
+use netsentry::render;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match run(&cli) {
-        Ok(output) => {
-            print!("{output}");
-            ExitCode::SUCCESS
-        }
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprint!("{}", netsentry::render::error_report(&error));
+            eprint!("{}", render::error_report(&error));
             ExitCode::FAILURE
         }
     }
 }
 
-/// Dispatches a parsed command and returns what should be printed.
-///
-/// Returning the output instead of printing it keeps stdout handling in exactly
-/// one place.
-fn run(cli: &Cli) -> netsentry::Result<String> {
-    match cli.command {
-        Command::List => {
-            let interfaces = netsentry::capture::list_interfaces()?;
-            Ok(netsentry::render::interface_list(&interfaces))
-        }
+/// Dispatches a parsed command.
+fn run(cli: &Cli) -> netsentry::Result<()> {
+    match &cli.command {
+        Command::List => run_list(),
+        Command::Capture(args) => run_capture(args),
     }
+}
+
+/// Prints the interface listing.
+fn run_list() -> netsentry::Result<()> {
+    let interfaces = capture::list_interfaces()?;
+    print!("{}", render::interface_list(&interfaces));
+    Ok(())
+}
+
+/// Opens a live capture and prints one line of metadata per packet.
+fn run_capture(args: &CaptureArgs) -> netsentry::Result<()> {
+    // Validate the user's numbers before touching the network, so bad input
+    // fails immediately and without needing any privileges.
+    let settings = CaptureSettings::new(args.snaplen, args.promiscuous, args.count)?;
+
+    let interfaces = capture::list_interfaces()?;
+    let interface = capture::resolve_interface(&interfaces, &args.interface)?;
+
+    let mut session = LiveCapture::open(interface, &settings)?;
+    print!(
+        "{}",
+        render::capture_header(interface, settings, session.link_type())
+    );
+
+    // Installed only once the capture is open, so Ctrl+C before that point
+    // still behaves the way the shell expects.
+    let interrupter = session.interrupter();
+    ctrlc::set_handler(move || interrupter.interrupt())
+        .map_err(|source| NetSentryError::SignalHandler { source })?;
+
+    // Locked once rather than per packet. stdout is line buffered, so each
+    // packet still reaches the terminal as it is captured.
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    let summary = session.run(|packet| writeln!(out, "{}", render::packet_line(packet)))?;
+
+    print!("{}", render::capture_summary(&summary));
+    Ok(())
 }

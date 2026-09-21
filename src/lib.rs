@@ -9,9 +9,12 @@
 //!
 //! ```text
 //! render    presentation, pure string formatting
-//! capture   where packets come from (interfaces today, live traffic next)
+//! capture   where packets come from: interface discovery and live capture
 //! error     the failure vocabulary shared by everything above
 //! ```
+//!
+//! Packet *contents* stop at the capture layer. Nothing above it receives
+//! payload bytes, and in this version nothing reads them at all.
 //!
 //! # Example
 //!
