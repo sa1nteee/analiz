@@ -6,19 +6,23 @@
 //! decoding is v0.2's job, and until there is a reason to touch payload bytes,
 //! not touching them is the safer default.
 //!
-//! Options live in [`crate::capture::settings`] and the counters a run produces
-//! live in [`crate::capture::stats`]; this module is the engine between them.
+//! Options live in [`crate::capture::settings`], the counters a run produces
+//! live in [`crate::capture::stats`], and the read loop itself lives in
+//! [`crate::capture::pump`] because offline analysis runs the same one.
 //!
 //! See [`LiveCapture::run`] for how the capture loop stays interruptible.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::capture::device::NetworkInterface;
+use crate::capture::pump::{LinkType, PacketMetadata, PumpOptions, describe_link_type, pump};
 use crate::capture::settings::CaptureSettings;
-use crate::capture::stats::{CaptureSummary, CaptureTally, DriverStats, StopReason};
+use crate::capture::stats::{CaptureSummary, DriverStats};
 use crate::capture::timestamp::PacketTimestamp;
+use crate::capture::writer::CaptureWriter;
 use crate::error::{NetSentryError, Result};
 
 /// How long a single read may block before the loop regains control, in
@@ -27,32 +31,6 @@ use crate::error::{NetSentryError, Result};
 /// 250 ms is short enough that a Ctrl+C feels instant and long enough that an
 /// idle interface costs four wake-ups per second rather than a spinning CPU.
 const READ_TIMEOUT_MS: i32 = 250;
-
-/// The link-layer format of a capture, as reported by the driver.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkType {
-    /// Numeric `DLT_*` value.
-    pub code: i32,
-    /// Short name, such as `EN10MB`.
-    pub name: String,
-    /// Human readable description, when libpcap knows one.
-    pub description: Option<String>,
-}
-
-/// What is known about one captured packet.
-///
-/// Note what is *not* here: the packet's bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PacketMetadata {
-    /// 1-based position within this capture run.
-    pub number: u64,
-    /// When the driver saw the packet.
-    pub timestamp: PacketTimestamp,
-    /// Bytes actually captured (limited by the snapshot length).
-    pub caplen: u32,
-    /// Bytes the packet had on the wire.
-    pub wirelen: u32,
-}
 
 /// Stops a running capture from another thread.
 ///
@@ -130,6 +108,34 @@ impl LiveCapture {
         self.settings
     }
 
+    /// Opens a pcap file to copy this capture's packets into.
+    ///
+    /// [`crate::capture::writer::prepare_capture_file`] must have been called
+    /// first; it is what refuses an existing file and sets the permissions this
+    /// one then inherits.
+    ///
+    /// # Errors
+    ///
+    /// [`NetSentryError::PathNotUtf8`] or [`NetSentryError::CaptureWriteOpen`].
+    pub fn open_savefile(&self, path: &Path) -> Result<CaptureWriter> {
+        // libpcap's binding unwraps this conversion internally, so a non-UTF-8
+        // path would panic inside the dependency rather than fail here.
+        if path.to_str().is_none() {
+            return Err(NetSentryError::PathNotUtf8 {
+                path: path.to_path_buf(),
+            });
+        }
+
+        let savefile =
+            self.handle
+                .savefile(path)
+                .map_err(|source| NetSentryError::CaptureWriteOpen {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        Ok(CaptureWriter::new(savefile, path.to_path_buf()))
+    }
+
     /// Creates a handle that can stop this capture from another thread.
     pub fn interrupter(&mut self) -> CaptureInterrupter {
         CaptureInterrupter {
@@ -162,69 +168,37 @@ impl LiveCapture {
     /// # Errors
     ///
     /// [`NetSentryError::CaptureRead`] if the driver reports a read failure.
-    pub fn run<F>(&mut self, mut on_packet: F) -> Result<CaptureSummary>
+    pub fn run<F>(
+        &mut self,
+        writer: Option<&mut CaptureWriter>,
+        on_packet: F,
+    ) -> Result<CaptureSummary>
     where
         F: FnMut(&PacketMetadata, &[u8]) -> std::io::Result<()>,
     {
-        let limit = self.settings.count();
         let started_at = wall_clock_now();
         let clock = Instant::now();
-        let mut tally = CaptureTally::default();
 
-        let stop_reason = loop {
-            if self.stop.load(Ordering::SeqCst) {
-                break StopReason::Interrupted;
-            }
-
-            match self.handle.next_packet() {
-                Ok(packet) => {
-                    tally.record(packet.header.caplen, packet.header.len);
-
-                    let metadata = PacketMetadata {
-                        number: tally.packets(),
-                        timestamp: PacketTimestamp::from_parts(
-                            widen(packet.header.ts.tv_sec),
-                            widen(packet.header.ts.tv_usec),
-                        ),
-                        caplen: packet.header.caplen,
-                        wirelen: packet.header.len,
-                    };
-
-                    // The packet's bytes are handed straight to the caller and
-                    // never retained here. What happens to them is the decode
-                    // layer's business, not the capture engine's.
-                    if on_packet(&metadata, packet.data).is_err() {
-                        break StopReason::OutputClosed;
-                    }
-                    if tally.limit_reached(limit) {
-                        break StopReason::CountReached;
-                    }
-                }
-                // A quiet interface: nothing arrived within the read timeout.
-                // This is the normal idle path, not an error.
-                Err(pcap::Error::TimeoutExpired) => continue,
-                // libpcap reports an interrupted read the same way it reports a
-                // file running out. On a live capture it means breakloop fired.
-                Err(pcap::Error::NoMorePackets) => {
-                    break if self.stop.load(Ordering::SeqCst) {
-                        StopReason::Interrupted
-                    } else {
-                        StopReason::SourceEnded
-                    };
-                }
-                Err(source) => return Err(NetSentryError::CaptureRead { source }),
-            }
+        let options = PumpOptions {
+            limit: self.settings.count(),
+            stop: Some(&self.stop),
+            sink: writer,
         };
+        let (run, failure) = pump(&mut self.handle, options, on_packet);
 
-        let elapsed = clock.elapsed();
-        let driver_stats = self.driver_stats();
+        // On a live capture a read failure means the interface went away
+        // mid-run. There is no partial file to salvage, so it is reported as
+        // the error it is.
+        if let Some(source) = failure {
+            return Err(NetSentryError::CaptureRead { source });
+        }
 
         Ok(CaptureSummary {
-            tally,
-            elapsed,
+            tally: run.tally,
+            elapsed: clock.elapsed(),
             started_at,
-            stop_reason,
-            driver_stats,
+            stop_reason: run.stop_reason,
+            driver_stats: self.driver_stats(),
         })
     }
 
@@ -238,32 +212,6 @@ impl LiveCapture {
                 if_dropped: stat.if_dropped,
             })
             .map_err(|source| NetSentryError::CaptureStatistics { source })
-    }
-}
-
-/// Widens a `timeval` field to `i64`.
-///
-/// `time_t` and `suseconds_t` are 64-bit on Linux and macOS but 32-bit on
-/// Windows, so this conversion is a no-op on some targets and load-bearing on
-/// others. Clippy only ever sees one target at a time and calls it useless
-/// there; the lint is suppressed here, in one place, rather than the code being
-/// made non-portable to satisfy it.
-#[allow(clippy::useless_conversion)]
-fn widen(value: impl Into<i64>) -> i64 {
-    value.into()
-}
-
-/// Turns a `DLT_*` value into something printable, without ever failing.
-///
-/// libpcap does not know every link type by name; an unknown one is reported by
-/// its number rather than dropped or guessed at.
-fn describe_link_type(link_type: pcap::Linktype) -> LinkType {
-    LinkType {
-        code: link_type.0,
-        name: link_type
-            .get_name()
-            .unwrap_or_else(|_| format!("DLT_{}", link_type.0)),
-        description: link_type.get_description().ok(),
     }
 }
 
@@ -339,26 +287,5 @@ mod tests {
                 "{message:?} should not be read as a privilege problem"
             );
         }
-    }
-
-    #[test]
-    fn timeval_fields_widen_on_every_target() {
-        // Exercised with both widths so the helper keeps compiling whichever
-        // one the target platform uses.
-        assert_eq!(widen(-1_i32), -1_i64);
-        assert_eq!(widen(i32::MAX), 2_147_483_647_i64);
-        assert_eq!(widen(i64::MIN), i64::MIN);
-    }
-
-    #[test]
-    fn unknown_link_types_are_named_by_number() {
-        let described = describe_link_type(pcap::Linktype(1));
-        assert_eq!(described.code, 1);
-        assert_eq!(described.name, "EN10MB");
-
-        let unknown = describe_link_type(pcap::Linktype(31_337));
-        assert_eq!(unknown.code, 31_337);
-        assert_eq!(unknown.name, "DLT_31337");
-        assert_eq!(unknown.description, None);
     }
 }

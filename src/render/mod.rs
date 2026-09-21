@@ -5,7 +5,8 @@
 //! unit testable, and means the same data can later be rendered as JSON or
 //! handed to a UI without rewriting anything.
 //!
-//! [`interfaces`] renders `netsentry list`, [`capture`] renders a capture run,
+//! [`interfaces`] renders `netsentry list`, [`capture`] renders a live or
+//! offline capture run,
 //! [`packet`] renders one decoded packet, and failures are rendered by
 //! [`error_report`].
 
@@ -13,7 +14,7 @@ pub mod capture;
 pub mod interfaces;
 pub mod packet;
 
-pub use capture::{capture_header, capture_summary};
+pub use capture::{capture_header, capture_summary, file_header, file_summary, write_warning};
 pub use interfaces::{format_address, interface_list, netmask_to_prefix_len};
 pub use packet::{packet_line, summary};
 

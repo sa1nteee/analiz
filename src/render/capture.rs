@@ -3,8 +3,11 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use std::path::Path;
+
 use crate::capture::{
-    CaptureSettings, CaptureSummary, DriverStats, LinkType, NetworkInterface, StopReason,
+    CaptureSettings, CaptureSummary, DriverStats, FileSummary, LinkType, NetworkInterface,
+    StopReason, TimeSpan,
 };
 use crate::render::sanitize_display_text;
 
@@ -61,6 +64,140 @@ pub fn capture_header(
     );
 
     out.push('\n');
+    out
+}
+
+/// Renders the banner printed before a capture file is analysed.
+pub fn file_header(path: &Path, link_type: &LinkType, limit: Option<u64>) -> String {
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "NetSentry {} \u{2014} offline analysis\n",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    banner(
+        &mut out,
+        "file",
+        &sanitize_display_text(&path.display().to_string()),
+    );
+    banner(&mut out, "format", "pcap/pcapng (read-only)");
+
+    let link = match link_type.description.as_deref().map(sanitize_display_text) {
+        Some(description) => format!("{} ({})", link_type.name, description),
+        None => link_type.name.clone(),
+    };
+    banner(&mut out, "link type", &link);
+    banner(
+        &mut out,
+        "read",
+        &match limit {
+            Some(1) => "first packet only".to_owned(),
+            Some(count) => format!("first {count} packets"),
+            None => "whole file".to_owned(),
+        },
+    );
+    banner(&mut out, "clock", "UTC");
+
+    out.push('\n');
+    out
+}
+
+/// Renders the summary printed once a capture file has been analysed.
+///
+/// The two kinds of time are labelled apart on purpose. `capture span` is when
+/// the traffic happened, taken from the packets; `read in` is how long
+/// NetSentry spent reading the file. Reporting the second as though it were the
+/// first would be a lie about the evidence.
+pub fn file_summary(summary: &FileSummary) -> String {
+    let mut out = String::new();
+    out.push('\n');
+
+    let _ = writeln!(
+        out,
+        "[*] Analysis finished ({}).\n",
+        stop_reason_phrase(summary.stop_reason)
+    );
+
+    let tally = summary.tally;
+    summary_row(&mut out, "packets analysed", &tally.packets().to_string());
+    summary_row(
+        &mut out,
+        "captured bytes",
+        &tally.captured_bytes().to_string(),
+    );
+    summary_row(&mut out, "wire bytes", &tally.wire_bytes().to_string());
+
+    out.push('\n');
+    render_time_span(&mut out, summary.time_span);
+    summary_row(
+        &mut out,
+        "read in",
+        &format!("{} (wall clock)", format_duration(summary.processing_time)),
+    );
+
+    if let Some(error) = &summary.read_error {
+        out.push('\n');
+        let _ = writeln!(out, "    the rest of the file could not be read:");
+        let _ = writeln!(out, "      {error}");
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            let _ = writeln!(out, "      cause: {cause}");
+            source = cause.source();
+        }
+    }
+
+    out
+}
+
+/// Writes the three rows describing when a capture's packets happened.
+fn render_time_span(out: &mut String, span: TimeSpan) {
+    match (span.first(), span.last()) {
+        (Some(first), Some(last)) => {
+            summary_row(out, "first packet", &first.format_datetime());
+            summary_row(out, "last packet", &last.format_datetime());
+            match span.duration() {
+                Some(duration) => summary_row(out, "capture span", &format_duration(duration)),
+                None => summary_row(
+                    out,
+                    "capture span",
+                    "unknown \u{2014} the file's timestamps are not in order",
+                ),
+            }
+        }
+        _ => {
+            summary_row(out, "first packet", "(none)");
+            summary_row(out, "last packet", "(none)");
+            summary_row(out, "capture span", "(no packets)");
+        }
+    }
+}
+
+/// Renders the warning shown before packets are written to disk.
+///
+/// Printed every time, without a way to silence it. Writing a capture file is
+/// the one thing NetSentry does that creates a lasting copy of other people's
+/// traffic, and the person running it should be reminded what that means.
+pub fn write_warning(path: &Path) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "[!] Writing full packets, payload included, to {}",
+        sanitize_display_text(&path.display().to_string())
+    );
+    let _ = writeln!(
+        out,
+        "    This file will contain whatever the traffic contained: credentials and"
+    );
+    let _ = writeln!(
+        out,
+        "    session tokens from plaintext protocols, hostnames, and your network's"
+    );
+    let _ = writeln!(
+        out,
+        "    internal layout. Store and share it accordingly.\n"
+    );
     out
 }
 
@@ -146,6 +283,7 @@ fn stop_reason_phrase(reason: StopReason) -> &'static str {
         StopReason::Interrupted => "interrupted by user",
         StopReason::SourceEnded => "capture source ended",
         StopReason::OutputClosed => "output closed",
+        StopReason::ReadFailed => "could not read any further",
     }
 }
 

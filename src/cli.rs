@@ -5,6 +5,8 @@
 //! work happens here, which keeps the command surface easy to change (and, at
 //! v0.9, easy to sit next to a Tauri front end rather than be replaced by one).
 
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
 use crate::capture::settings::{DEFAULT_SNAPLEN, MAX_SNAPLEN, MIN_SNAPLEN};
@@ -53,6 +55,40 @@ pub enum Command {
                       Press Ctrl+C to stop a capture that has no --count limit."
     )]
     Capture(CaptureArgs),
+
+    /// Analyse a saved capture file
+    #[command(
+        visible_alias = "analyze",
+        long_about = "Reads a pcap or pcapng file and decodes it exactly as a live capture\n\
+                      is decoded, printing one line of metadata per packet.\n\n\
+                      The file is opened read-only and never modified. No privileges are\n\
+                      needed: reading a file is not capturing.\n\n\
+                      Capture files routinely contain credentials, session cookies, visited\n\
+                      hostnames and internal network layout. Treat one as you would the\n\
+                      traffic it came from."
+    )]
+    Read(ReadArgs),
+}
+
+/// Options for the `read` command.
+#[derive(Debug, Args)]
+pub struct ReadArgs {
+    /// The capture file to analyse
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Stop after this many packets [default: read the whole file]
+    #[arg(
+        short = 'c',
+        long,
+        value_name = "N",
+        long_help = "Analyse only the first N packets of the file.\n\n\
+                     This reads the file from the start and stops early; it is not a\n\
+                     filter, and it does not skip anything. The rest of the file is\n\
+                     left unread, so the summary describes what was analysed rather\n\
+                     than what the file contains."
+    )]
+    pub count: Option<u64>,
 }
 
 /// Options for the `capture` command.
@@ -89,6 +125,24 @@ pub struct CaptureArgs {
                      with --promiscuous false to capture only this host's own traffic."
     )]
     pub promiscuous: bool,
+
+    /// Also write the captured packets to a pcap file
+    #[arg(
+        short = 'w',
+        long,
+        value_name = "FILE",
+        long_help = "Write every captured packet to FILE in pcap format, in addition to\n\
+                     printing it.\n\n\
+                     This writes FULL PACKET CONTENTS to disk, including payload: \n\
+                     passwords, cookies and tokens carried in plaintext protocols end\n\
+                     up in the file. Without this option NetSentry writes nothing at\n\
+                     all. An existing file is refused unless --overwrite is given."
+    )]
+    pub write: Option<PathBuf>,
+
+    /// Replace the --write file if it already exists
+    #[arg(long, requires = "write")]
+    pub overwrite: bool,
 }
 
 /// Builds the `--snaplen` long help from the library's own bounds, so the two
@@ -220,6 +274,84 @@ mod tests {
         assert!(help.contains(&MIN_SNAPLEN.to_string()));
         assert!(help.contains(&MAX_SNAPLEN.to_string()));
         assert!(help.contains(&DEFAULT_SNAPLEN.to_string()));
+    }
+
+    #[test]
+    fn read_takes_a_path_and_an_optional_count() {
+        let parsed = Cli::try_parse_from(["netsentry", "read", "capture.pcap"]);
+        match parsed.map(|cli| cli.command) {
+            Ok(Command::Read(args)) => {
+                assert_eq!(args.file, PathBuf::from("capture.pcap"));
+                assert_eq!(args.count, None, "no --count means read the whole file");
+            }
+            other => panic!("did not parse: {other:?}"),
+        }
+
+        let parsed = Cli::try_parse_from(["netsentry", "read", "/tmp/a b.pcap", "-c", "100"]);
+        match parsed.map(|cli| cli.command) {
+            Ok(Command::Read(args)) => {
+                assert_eq!(args.file, PathBuf::from("/tmp/a b.pcap"));
+                assert_eq!(args.count, Some(100));
+            }
+            other => panic!("did not parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_is_accepted_as_a_name_for_read() {
+        let parsed = Cli::try_parse_from(["netsentry", "analyze", "capture.pcap"]);
+        assert!(matches!(
+            parsed.map(|cli| cli.command),
+            Ok(Command::Read(_))
+        ));
+    }
+
+    #[test]
+    fn read_requires_a_file() {
+        assert!(Cli::try_parse_from(["netsentry", "read"]).is_err());
+    }
+
+    #[test]
+    fn capture_writes_nothing_unless_asked() {
+        let parsed = Cli::try_parse_from(["netsentry", "capture", "-i", "1"]);
+        match parsed.map(|cli| cli.command) {
+            Ok(Command::Capture(args)) => {
+                assert_eq!(args.write, None, "no --write means nothing is written");
+                assert!(!args.overwrite);
+            }
+            other => panic!("did not parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_accepts_a_write_target() {
+        let parsed = Cli::try_parse_from(["netsentry", "capture", "-i", "1", "-w", "session.pcap"]);
+        match parsed.map(|cli| cli.command) {
+            Ok(Command::Capture(args)) => {
+                assert_eq!(args.write, Some(PathBuf::from("session.pcap")));
+                assert!(!args.overwrite);
+            }
+            other => panic!("did not parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overwrite_is_meaningless_without_write() {
+        // --overwrite on its own would silently do nothing, which is exactly
+        // the kind of option that gets typed in the belief it did something.
+        assert!(Cli::try_parse_from(["netsentry", "capture", "-i", "1", "--overwrite"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "netsentry",
+                "capture",
+                "-i",
+                "1",
+                "-w",
+                "out.pcap",
+                "--overwrite"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

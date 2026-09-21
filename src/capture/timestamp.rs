@@ -49,6 +49,20 @@ impl PacketTimestamp {
         self.microseconds
     }
 
+    /// The timestamp as whole microseconds since the epoch.
+    ///
+    /// Returns [`None`] for a `timeval` that cannot be expressed that way, so
+    /// arithmetic on timestamps can never silently wrap. `i128` is used because
+    /// a nonsensical `tv_sec` near [`i64::MAX`] would overflow `i64` micros.
+    pub fn micros_since_epoch(self) -> Option<i128> {
+        if self.microseconds < 0 || self.microseconds >= MICROS_PER_SECOND {
+            return None;
+        }
+        i128::from(self.seconds)
+            .checked_mul(i128::from(MICROS_PER_SECOND))?
+            .checked_add(i128::from(self.microseconds))
+    }
+
     /// The timestamp as a UTC calendar time, or [`None`] if it is not a valid
     /// point in time.
     fn to_utc(self) -> Option<(OffsetDateTime, u32)> {
@@ -148,6 +162,33 @@ mod tests {
             let rendered = ts.format_datetime();
             assert!(rendered.contains("raw"), "unexpected output: {rendered}");
         }
+    }
+
+    #[test]
+    fn epoch_micros_are_exact_and_refuse_nonsense() {
+        assert_eq!(
+            PacketTimestamp::from_parts(2, 500_000).micros_since_epoch(),
+            Some(2_500_000)
+        );
+        assert_eq!(
+            PacketTimestamp::from_parts(-1, 500_000).micros_since_epoch(),
+            Some(-500_000)
+        );
+        // An out-of-range remainder is not a point in time.
+        assert_eq!(
+            PacketTimestamp::from_parts(0, -1).micros_since_epoch(),
+            None
+        );
+        assert_eq!(
+            PacketTimestamp::from_parts(0, MICROS_PER_SECOND).micros_since_epoch(),
+            None
+        );
+        // i64::MAX seconds would overflow i64 micros; i128 holds it.
+        assert!(
+            PacketTimestamp::from_parts(i64::MAX, 0)
+                .micros_since_epoch()
+                .is_some()
+        );
     }
 
     #[test]

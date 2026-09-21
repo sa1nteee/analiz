@@ -7,10 +7,11 @@ between hosts, and explains *why* a piece of traffic looks suspicious. The
 analysis engine is a plain Rust library with no UI dependencies; a desktop front
 end is planned for a later version.
 
-> **Status: v0.2 — under construction.**
-> NetSentry can list capture interfaces, capture live packets and decode them
-> down to the transport layer. Grouping packets into conversations is v0.4's
-> job; detecting suspicious behaviour is v0.7's.
+> **Status: v0.3 — under construction.**
+> NetSentry can list capture interfaces, capture live packets, save them to a
+> pcap file and analyse saved captures — all through one decoder. Grouping
+> packets into conversations is v0.4's job; detecting suspicious behaviour is
+> v0.7's.
 
 ## Requirements
 
@@ -54,12 +55,16 @@ libpcap ships with the system; no extra package is needed.
 ## Usage
 
 ```bash
-netsentry list                       # show the interfaces the capture driver can see
-netsentry capture -i 1               # capture until Ctrl+C
-netsentry capture -i 1 --count 20    # capture 20 packets, then stop
-netsentry capture -i eth0            # interfaces can be named instead of numbered
+netsentry list                            # show the interfaces the capture driver can see
+netsentry capture -i 1                    # capture until Ctrl+C
+netsentry capture -i 1 --count 20         # capture 20 packets, then stop
+netsentry capture -i eth0                 # interfaces can be named instead of numbered
+netsentry capture -i 1 -w session.pcap    # also save the packets to a file
+netsentry read session.pcap               # analyse a saved capture
+netsentry read session.pcap --count 100   # analyse only its first 100 packets
 netsentry --help
 netsentry capture --help
+netsentry read --help
 ```
 
 ### `netsentry list`
@@ -133,13 +138,133 @@ UTC means a timestamp still means the same thing on someone else's machine.
 Press **Ctrl+C** to stop a capture that has no `--count` limit. The capture
 stops at the next packet boundary and still prints its summary.
 
+### `netsentry read`
+
+Analyses a saved capture through exactly the same decoder and renderer a live
+capture uses. The file is opened read-only and is never modified.
+
+```text
+$ netsentry read session.pcap
+NetSentry 0.1.0 — offline analysis
+
+[*] file        : session.pcap
+[*] format      : pcap/pcapng (read-only)
+[*] link type   : EN10MB (Ethernet)
+[*] read        : whole file
+[*] clock       : UTC
+
+     1  14:04:49.568771  192.0.2.2:57782 → 160.79.104.10:443 TCP ACK
+     2  14:04:49.568960  160.79.104.10:443 → 192.0.2.2:57782 TCP ACK
+     ...
+     6  14:04:50.048811  192.0.2.2:57758 → 160.79.104.10:443 TCP ACK
+
+[*] Analysis finished (capture source ended).
+
+    packets analysed     : 6
+    captured bytes       : 396
+    wire bytes           : 396
+
+    first packet         : 2026-09-21 14:04:49.568771 UTC
+    last packet          : 2026-09-21 14:04:50.048811 UTC
+    capture span         : 0.480s
+    read in              : 0.000s (wall clock)
+```
+
+| Option | Default | Meaning |
+| ------ | ------- | ------- |
+| `<FILE>` | *required* | The capture to analyse |
+| `-c`, `--count <N>` | whole file | Analyse only the first N packets |
+
+`analyze` is accepted as an alias for `read`.
+
+Two different clocks appear in that summary and they are labelled apart on
+purpose. **`capture span`** is when the traffic happened, taken from the
+packets' own timestamps. **`read in`** is how long NetSentry spent reading the
+file. Reading a three-hour capture takes milliseconds; reporting the second
+number as though it were the first would be a lie about the evidence.
+
+`--count` stops reading early. It is not a filter: it does not skip anything,
+and the rest of the file is left unread, so the summary describes what was
+analysed rather than what the file contains.
+
+**Reading a capture file needs no privileges.** Capturing does; opening a file
+does not. Verified: an unprivileged user that cannot capture on any interface
+reads a capture file successfully.
+
+### Saving a capture
+
+```bash
+netsentry capture -i 1 --write session.pcap
+netsentry capture -i 1 --write session.pcap --overwrite
+```
+
+Without `--write`, NetSentry writes nothing at all — that has not changed.
+With it, **full packets including payload** are written to the file:
+
+```text
+[!] Writing full packets, payload included, to session.pcap
+    This file will contain whatever the traffic contained: credentials and
+    session tokens from plaintext protocols, hostnames, and your network's
+    internal layout. Store and share it accordingly.
+```
+
+* An existing file is **refused**, not replaced, unless `--overwrite` is given.
+  A capture cannot be re-recorded, so truncating one is not a recoverable
+  mistake.
+* The file is created with **owner-only permissions** (mode `0600`) on Unix,
+  before libpcap opens it. libpcap's own `fopen` would create it
+  world-readable subject to your umask, and this file is about to contain
+  other people's credentials.
+* The output path is checked **before** the interface is opened, so a mistyped
+  path costs nothing.
+
+### Supported capture formats
+
+| Format | Read | Write |
+| ------ | ---- | ----- |
+| `.pcap` (classic libpcap) | yes | yes |
+| `.pcapng` (single interface) | yes | no |
+| `.pcapng` (several interfaces of different link types) | first interface only | no |
+| Compressed captures (`.gz`, `.zst`) | no — decompress first | no |
+
+pcapng support comes from libpcap itself rather than from any extra
+dependency, and it inherits libpcap's limitation: a pcapng file may contain
+several interfaces, but libpcap exposes only one link type per handle. A file
+whose second interface has a *different* link type is read up to that point
+and then reports `an interface has a type 113 different from the type of the
+first interface`. Files written by `tcpdump -w` and by Wireshark's single-
+interface captures are unaffected.
+
+### Reading a damaged capture
+
+A capture whose writer was killed mid-packet still contains everything before
+the damage, and NetSentry reports it rather than discarding it:
+
+```text
+    packets analysed     : 5
+    ...
+    the rest of the file could not be read:
+      capture file is truncated or corrupt: cut.pcap
+      cause: libpcap error: truncated dump file; tried to read 66 captured bytes, only got 26
+```
+
+The exit code is still non-zero, so a script notices.
+
+Note the distinction NetSentry draws:
+
+* A damaged **file structure** — a bad global header, a packet record cut in
+  half, a declared packet length larger than the file — is a *file* error.
+* A **well-stored packet that is itself short**, as happens with a small
+  `--snaplen`, is not a file error at all. It goes through the decoder's
+  ordinary graceful degradation and prints as `[truncated IPv4]`.
+
+
 ### What this version does not do
 
-Packet **payload is never printed, written to disk, or logged.** Headers are
-decoded and described; the bytes after them are not read at all. Captured
-traffic routinely contains credentials, session cookies and other personal
-data, so until there is a reason to handle payload bytes, NetSentry does not
-handle them.
+Packet **payload is never printed or logged**, and is only ever written to disk
+when `--write` explicitly asks for a capture file. Headers are decoded and
+described; the bytes after them are not read at all. Nothing above the
+transport layer is parsed.
 
 ## What NetSentry decodes
 
@@ -235,6 +360,9 @@ The project is a single crate split into a library and a thin binary:
 | `src/capture/settings.rs`  | Capture options and their validation rules.           |
 | `src/capture/live.rs`      | The capture engine: opens a handle, pumps packets.    |
 | `src/capture/stats.rs`     | Packet/byte accounting and the run's outcome.         |
+| `src/capture/offline.rs`   | Reading a capture file.                               |
+| `src/capture/pump.rs`      | The read loop live and offline capture share.         |
+| `src/capture/writer.rs`    | Saving captured packets to a pcap file.               |
 | `src/capture/timestamp.rs` | Packet timestamps and their conversion to text.       |
 | `src/decode/bytes.rs`      | The bounds-checked cursor all parsing goes through.   |
 | `src/decode/link.rs`       | Ethernet, VLAN and Linux cooked-capture decoding.     |
@@ -246,6 +374,20 @@ The project is a single crate split into a library and a thin binary:
 Layer dependencies point one way only — `render` above `decode` above
 `capture` — and `unsafe` code is `forbid`-den crate-wide: the only unsafe code
 in the build lives inside the `pcap` crate's FFI bindings.
+
+A live interface and a capture file share one pipeline:
+
+```text
+interface ─┐
+           ├─→ pump ─→ decode ─→ domain model ─→ render
+pcap file ─┘
+```
+
+There is no `PacketSource` trait, deliberately. The `pcap` crate already has
+one: `Capture<Active>` and `Capture<Offline>` both implement `pcap::Activated`,
+and everything the read loop needs is defined once for any
+`Capture<T: Activated>`. Adding our own abstraction on top would be a layer
+that renames someone else's.
 
 The decoder is a single pure function, `decode(link, &[u8]) -> DecodedPacket`.
 It knows nothing about libpcap, interfaces or terminals, holds no state, and
@@ -279,9 +421,19 @@ arrays, and why it is ready to be pointed at `cargo-fuzz` unchanged.
   0x0600 is an 802.3 length field, which NetSentry reports as such rather than
   misreading as a protocol.
 
-### Capture
+### Capture and capture files
 
-* **Captures cannot be saved or loaded.** `.pcap` support is v0.3.
+* **A pcapng file with several link types is read only as far as its first
+  interface**, because libpcap exposes one link type per handle. See
+  *Supported capture formats* above.
+* **Compressed captures are not supported.** Decompress them first.
+* **Captures cannot be merged, filtered or rewritten.** `read` analyses, it
+  does not transform. Display filters are v0.6.
+* **`--count` is a limit, not a filter.** It stops reading, it does not skip.
+* **There is a small window between checking a path and opening it.** NetSentry
+  diagnoses filesystem problems with `std::fs` and then hands the path to
+  libpcap, so a file replaced in between would produce a less precise error.
+  For a read-only analysis that is the whole consequence.
 * **Interface status comes straight from the driver's `UP`/`RUNNING` flags.**
   NetSentry does not consult platform-specific APIs to refine it. libpcap has
   reported these flags since 1.6.1 and Npcap reports them, but a driver that
@@ -290,13 +442,16 @@ arrays, and why it is ready to be pointed at `cargo-fuzz` unchanged.
 * **Interface-level drop counts cannot be trusted to mean "none".** libpcap sets
   `ps_ifdrop` to zero on platforms that do not support it and gives no way to
   tell that apart from a genuine zero, so NetSentry prints the number with that
-  caveat attached rather than presenting it as a fact.
-* **Permission errors are recognised by their text.** libpcap reports why an
-  open failed as free-form English, so the "not allowed to capture" message is a
-  best-effort reading of it. The generic open error mentions privileges too.
+  caveat attached rather than presenting it as a fact. Driver statistics do not
+  exist at all for a capture file, and are not shown there.
+* **Permission errors on an interface are recognised by their text.** libpcap
+  reports why an open failed as free-form English. Capture *file* errors do not
+  rely on this: they are diagnosed with `std::fs` before libpcap is involved.
 * **A missing Npcap installation cannot be reported as a friendly error on
   Windows.** `wpcap.dll` is resolved by the Windows loader before `main()` runs,
   so the process fails to start and Windows — not NetSentry — shows the error.
+  This affects `read` as well as `capture`: the DLL must be present even for
+  offline analysis, although the *driver* and Administrator rights are not.
 * **IPv6 scope IDs are not shown** in the interface listing, because libpcap
   does not report them.
 * **High packet rates are not tuned for.** Packets are read, decoded and printed
@@ -312,11 +467,26 @@ Only capture traffic on networks you own or have explicit written authorisation
 to monitor. Intercepting communications without authorisation is a criminal
 offence in most jurisdictions. You are responsible for how you use this tool.
 
-This version reads packet **headers** only. Payload is never printed, stored or
-logged, and is not even kept in memory past the moment a packet is decoded. That
-reduces the exposure but does not remove it: headers alone reveal who talks to
-whom, when, how often and how much — which is frequently more than enough to
-identify people and what they were doing.
+### Capture files are sensitive
+
+A `.pcap` file is a recording of a network. It routinely contains:
+
+* every domain and IP address that was contacted,
+* credentials and session tokens carried by plaintext protocols,
+* authentication material and API keys,
+* the internal layout of a private network — hosts, services, naming.
+
+Treat a capture file as you would treat the traffic it came from. NetSentry
+analyses it **entirely locally**. This version sends no capture data, and no
+derivative of it, to any network service, AI service or telemetry endpoint —
+it makes no outbound connections at all.
+
+What NetSentry itself reads and writes:
+
+* **`read`** opens the file read-only and never modifies it.
+* **`capture`** prints headers only and writes nothing, unless `--write` names
+  a file — in which case full packets including payload are saved, with a
+  warning, at mode `0600`.
 
 ## Licence
 

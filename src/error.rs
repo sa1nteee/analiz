@@ -11,6 +11,8 @@
 //! * the [`source`](std::error::Error::source) chain — *why* it went wrong,
 //! * [`NetSentryError::hints`] — what the *user* can do about it.
 
+use std::path::PathBuf;
+
 /// Convenience alias for results produced by NetSentry.
 pub type Result<T> = std::result::Result<T, NetSentryError>;
 
@@ -109,6 +111,102 @@ pub enum NetSentryError {
         source: pcap::Error,
     },
 
+    /// The capture file does not exist.
+    #[error("capture file not found: {}", path.display())]
+    CaptureFileMissing {
+        /// The path that was asked for.
+        path: PathBuf,
+    },
+
+    /// The capture file exists but cannot be opened by this user.
+    #[error("not allowed to read capture file: {}", path.display())]
+    CaptureFilePermissionDenied {
+        /// The path that was asked for.
+        path: PathBuf,
+    },
+
+    /// The path names a directory, not a file.
+    #[error("{} is a directory, not a capture file", path.display())]
+    CaptureFileIsDirectory {
+        /// The path that was asked for.
+        path: PathBuf,
+    },
+
+    /// The capture file could not be opened, for some other reason.
+    #[error("could not read capture file: {}", path.display())]
+    CaptureFileUnreadable {
+        /// The path that was asked for.
+        path: PathBuf,
+        /// What the operating system said.
+        reason: String,
+    },
+
+    /// The file opened but is not a capture file NetSentry can read.
+    #[error("{} is not a capture file NetSentry can read", path.display())]
+    CaptureFileFormat {
+        /// The path that was asked for.
+        path: PathBuf,
+        /// The underlying libpcap/Npcap failure.
+        #[source]
+        source: pcap::Error,
+    },
+
+    /// The capture file ended or became unreadable part way through.
+    ///
+    /// The packets before the damage were still analysed; this reports that
+    /// the rest of the file could not be.
+    #[error("capture file is truncated or corrupt: {}", path.display())]
+    CaptureFileCorrupt {
+        /// The path that was being read.
+        path: PathBuf,
+        /// The underlying libpcap/Npcap failure.
+        #[source]
+        source: pcap::Error,
+    },
+
+    /// A path could not be given to libpcap, which requires valid UTF-8.
+    #[error("path is not valid UTF-8: {}", path.display())]
+    PathNotUtf8 {
+        /// The offending path.
+        path: PathBuf,
+    },
+
+    /// The output file already exists and overwriting was not requested.
+    #[error("{} already exists", path.display())]
+    OutputFileExists {
+        /// The path that would have been overwritten.
+        path: PathBuf,
+    },
+
+    /// The capture file could not be created.
+    #[error("could not create capture file: {}", path.display())]
+    OutputFileUnwritable {
+        /// The path that was asked for.
+        path: PathBuf,
+        /// What the operating system said.
+        reason: String,
+    },
+
+    /// libpcap refused to start writing the capture file.
+    #[error("could not start writing capture file: {}", path.display())]
+    CaptureWriteOpen {
+        /// The path that was asked for.
+        path: PathBuf,
+        /// The underlying libpcap/Npcap failure.
+        #[source]
+        source: pcap::Error,
+    },
+
+    /// Writing to the capture file failed.
+    #[error("could not write capture file: {}", path.display())]
+    CaptureWriteFailed {
+        /// The file being written.
+        path: PathBuf,
+        /// The underlying libpcap/Npcap failure.
+        #[source]
+        source: pcap::Error,
+    },
+
     /// The interrupt handler could not be installed.
     #[error("could not install the Ctrl+C handler")]
     SignalHandler {
@@ -169,6 +267,41 @@ impl NetSentryError {
                 "the captured packets are still correct; only the driver's own counters are missing",
                 "not every capture source keeps statistics",
             ],
+            Self::CaptureFileMissing { .. } => {
+                &["check the path, including its spelling and any quoting the shell may have eaten"]
+            }
+            Self::CaptureFilePermissionDenied { .. } => &[
+                "capture files often belong to root, because capturing needs privileges",
+                "check the file's owner and mode, or copy it somewhere you can read",
+            ],
+            Self::CaptureFileIsDirectory { .. } => {
+                &["pass the capture file itself, not the folder containing it"]
+            }
+            Self::CaptureFileUnreadable { .. } => {
+                &["check that the path is a regular file and that its device is available"]
+            }
+            Self::CaptureFileFormat { .. } => &[
+                "NetSentry reads pcap and pcapng files, as written by tcpdump, Wireshark or dumpcap",
+                "a compressed capture (.gz, .zst) has to be decompressed first",
+            ],
+            Self::CaptureFileCorrupt { .. } => &[
+                "the packets reported above were read successfully; the rest of the file was not",
+                "a capture cut short like this usually means its writer was killed mid-write",
+            ],
+            Self::PathNotUtf8 { .. } => &[
+                "libpcap only accepts paths that are valid UTF-8",
+                "rename the file, or move it somewhere with a plain ASCII path",
+            ],
+            Self::OutputFileExists { .. } => &[
+                "pass --overwrite to replace it, or choose another name",
+                "a capture file is refused rather than replaced, because it cannot be re-recorded",
+            ],
+            Self::CaptureWriteFailed { .. } => {
+                &["the disk may be full, or the file may have been removed mid-capture"]
+            }
+            Self::OutputFileUnwritable { .. } | Self::CaptureWriteOpen { .. } => {
+                &["check that the directory exists and that you can write to it"]
+            }
             Self::SignalHandler { .. } => {
                 &["another handler for Ctrl+C may already be installed in this process"]
             }
@@ -233,6 +366,41 @@ mod tests {
                 source: pcap::Error::InvalidString,
             },
             NetSentryError::CaptureStatistics {
+                source: pcap::Error::InvalidString,
+            },
+            NetSentryError::CaptureFileMissing {
+                path: "/tmp/x.pcap".into(),
+            },
+            NetSentryError::CaptureFilePermissionDenied {
+                path: "/tmp/x.pcap".into(),
+            },
+            NetSentryError::CaptureFileIsDirectory {
+                path: "/tmp".into(),
+            },
+            NetSentryError::CaptureFileUnreadable {
+                path: "/tmp/x.pcap".into(),
+                reason: "device not ready".into(),
+            },
+            NetSentryError::CaptureFileFormat {
+                path: "/tmp/x.pcap".into(),
+                source: pcap::Error::InvalidString,
+            },
+            NetSentryError::CaptureFileCorrupt {
+                path: "/tmp/x.pcap".into(),
+                source: pcap::Error::InvalidString,
+            },
+            NetSentryError::PathNotUtf8 {
+                path: "/tmp/x.pcap".into(),
+            },
+            NetSentryError::OutputFileExists {
+                path: "/tmp/x.pcap".into(),
+            },
+            NetSentryError::OutputFileUnwritable {
+                path: "/tmp/x.pcap".into(),
+                reason: "read-only filesystem".into(),
+            },
+            NetSentryError::CaptureWriteOpen {
+                path: "/tmp/x.pcap".into(),
                 source: pcap::Error::InvalidString,
             },
         ];
