@@ -138,7 +138,8 @@ impl LiveCapture {
         }
     }
 
-    /// Runs the capture loop, calling `on_packet` for every packet.
+    /// Runs the capture loop, calling `on_packet` with each packet's metadata
+    /// and its raw bytes.
     ///
     /// # Staying interruptible
     ///
@@ -163,7 +164,7 @@ impl LiveCapture {
     /// [`NetSentryError::CaptureRead`] if the driver reports a read failure.
     pub fn run<F>(&mut self, mut on_packet: F) -> Result<CaptureSummary>
     where
-        F: FnMut(&PacketMetadata) -> std::io::Result<()>,
+        F: FnMut(&PacketMetadata, &[u8]) -> std::io::Result<()>,
     {
         let limit = self.settings.count();
         let started_at = wall_clock_now();
@@ -189,7 +190,10 @@ impl LiveCapture {
                         wirelen: packet.header.len,
                     };
 
-                    if on_packet(&metadata).is_err() {
+                    // The packet's bytes are handed straight to the caller and
+                    // never retained here. What happens to them is the decode
+                    // layer's business, not the capture engine's.
+                    if on_packet(&metadata, packet.data).is_err() {
                         break StopReason::OutputClosed;
                     }
                     if tally.limit_reached(limit) {

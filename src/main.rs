@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use clap::Parser as _;
 use netsentry::capture::{self, CaptureSettings, LiveCapture};
 use netsentry::cli::{CaptureArgs, Cli, Command};
+use netsentry::decode::{self, LinkLayer};
 use netsentry::error::NetSentryError;
 use netsentry::render;
 
@@ -67,7 +68,13 @@ fn run_capture(args: &CaptureArgs) -> netsentry::Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    let summary = session.run(|packet| writeln!(out, "{}", render::packet_line(packet)))?;
+    // Capture hands over bytes, decode interprets them, render prints the
+    // result. Each step knows only about the one below it.
+    let link_layer = LinkLayer::from_dlt(session.link_type().code);
+    let summary = session.run(|metadata, bytes| {
+        let decoded = decode::decode(link_layer, bytes);
+        writeln!(out, "{}", render::packet_line(metadata, &decoded))
+    })?;
 
     print!("{}", render::capture_summary(&summary));
     Ok(())

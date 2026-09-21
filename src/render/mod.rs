@@ -6,13 +6,16 @@
 //! handed to a UI without rewriting anything.
 //!
 //! [`interfaces`] renders `netsentry list`, [`capture`] renders a capture run,
-//! and failures are rendered by [`error_report`].
+//! [`packet`] renders one decoded packet, and failures are rendered by
+//! [`error_report`].
 
 pub mod capture;
 pub mod interfaces;
+pub mod packet;
 
-pub use capture::{capture_header, capture_summary, packet_line};
+pub use capture::{capture_header, capture_summary};
 pub use interfaces::{format_address, interface_list, netmask_to_prefix_len};
+pub use packet::{packet_line, summary};
 
 use std::fmt::Write as _;
 

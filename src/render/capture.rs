@@ -4,8 +4,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::capture::{
-    CaptureSettings, CaptureSummary, DriverStats, LinkType, NetworkInterface, PacketMetadata,
-    StopReason,
+    CaptureSettings, CaptureSummary, DriverStats, LinkType, NetworkInterface, StopReason,
 };
 use crate::render::sanitize_display_text;
 
@@ -68,20 +67,6 @@ pub fn capture_header(
 /// Writes one `[*] label : value` banner line.
 fn banner(out: &mut String, label: &str, value: &str) {
     let _ = writeln!(out, "[*] {label:<12}: {value}");
-}
-
-/// Renders one packet as a single line of metadata.
-///
-/// Deliberately carries no packet contents: only when it arrived, how much of
-/// it was captured, and how big it was on the wire.
-pub fn packet_line(packet: &PacketMetadata) -> String {
-    format!(
-        "{:>6}  {}  caplen={}  wirelen={}",
-        packet.number,
-        packet.timestamp.format_time_of_day(),
-        packet.caplen,
-        packet.wirelen
-    )
 }
 
 /// Renders the summary printed once a capture run is over.
@@ -194,15 +179,6 @@ mod tests {
         }
     }
 
-    fn packet(number: u64, caplen: u32, wirelen: u32) -> PacketMetadata {
-        PacketMetadata {
-            number,
-            timestamp: PacketTimestamp::from_parts(1_790_005_351, 381_204),
-            caplen,
-            wirelen,
-        }
-    }
-
     fn summary(
         stop_reason: StopReason,
         stats: Result<DriverStats, NetSentryError>,
@@ -261,33 +237,6 @@ mod tests {
         assert!(header.contains("promiscuous : off"));
         // No description means no empty parentheses.
         assert!(header.contains("interface   : eth0\n"), "{header}");
-    }
-
-    #[test]
-    fn packet_line_shows_metadata_and_nothing_else() {
-        let line = packet_line(&packet(1, 74, 74));
-        assert_eq!(line, "     1  15:42:31.381204  caplen=74  wirelen=74");
-    }
-
-    #[test]
-    fn packet_line_distinguishes_truncated_packets() {
-        // A packet cut short by the snapshot length must show both lengths, so
-        // the user can see that analysis data is missing.
-        let line = packet_line(&packet(42, 96, 1514));
-        assert!(line.contains("caplen=96"));
-        assert!(line.contains("wirelen=1514"));
-        assert!(line.starts_with("    42  "));
-    }
-
-    #[test]
-    fn packet_line_survives_an_unconvertible_timestamp() {
-        let odd = PacketMetadata {
-            number: 1,
-            timestamp: PacketTimestamp::from_parts(i64::MAX, -5),
-            caplen: 60,
-            wirelen: 60,
-        };
-        assert!(packet_line(&odd).contains("raw"));
     }
 
     #[test]
