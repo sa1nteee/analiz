@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use netsentry::capture::{CaptureFile, StopReason};
 use netsentry::decode::{LinkLayer, NetworkLayer, TransportLayer, decode};
 use netsentry::error::NetSentryError;
+use netsentry::flow::{FlowProtocol, FlowTable};
 
 /// A scratch file that deletes itself.
 struct Scratch(PathBuf);
@@ -98,6 +99,55 @@ fn udp() -> Vec<u8> {
     datagram.extend_from_slice(&8u16.to_be_bytes());
     datagram.extend_from_slice(&[0x12, 0x34]);
     datagram
+}
+
+/// A TCP segment with arbitrary ports and flags.
+fn tcp(source: u16, destination: u16, flags: u8) -> Vec<u8> {
+    let mut segment = Vec::new();
+    segment.extend_from_slice(&source.to_be_bytes());
+    segment.extend_from_slice(&destination.to_be_bytes());
+    segment.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0]);
+    segment.push(0x50);
+    segment.push(flags);
+    segment.extend_from_slice(&[0xfa, 0xf0, 0, 0, 0, 0]);
+    segment
+}
+
+/// A UDP datagram with arbitrary ports.
+fn udp_ports(source: u16, destination: u16) -> Vec<u8> {
+    let mut datagram = Vec::new();
+    datagram.extend_from_slice(&source.to_be_bytes());
+    datagram.extend_from_slice(&destination.to_be_bytes());
+    datagram.extend_from_slice(&8u16.to_be_bytes());
+    datagram.extend_from_slice(&[0x12, 0x34]);
+    datagram
+}
+
+/// An IPv4 header between two chosen hosts.
+fn ipv4_between(source: [u8; 4], destination: [u8; 4], protocol: u8, payload: &[u8]) -> Vec<u8> {
+    let total = u16::try_from(20 + payload.len()).unwrap_or(u16::MAX);
+    let mut header = vec![0x45, 0x00];
+    header.extend_from_slice(&total.to_be_bytes());
+    header.extend_from_slice(&[0x1c, 0x46, 0x40, 0x00, 0x40, protocol, 0x00, 0x00]);
+    header.extend_from_slice(&source);
+    header.extend_from_slice(&destination);
+    header.extend_from_slice(payload);
+    header
+}
+
+/// Reads a file into a flow table, the way `--flows` does.
+fn flows_of(path: &Path, limit: Option<u64>) -> FlowTable {
+    let mut file = match CaptureFile::open(path) {
+        Ok(file) => file,
+        Err(error) => panic!("could not open fixture: {error}"),
+    };
+    let link = LinkLayer::from_dlt(file.link_type().code);
+    let mut table = FlowTable::default();
+    let _ = file.run(limit, |metadata, bytes| {
+        table.record(metadata, &decode(link, bytes));
+        Ok(())
+    });
+    table
 }
 
 /// An ICMP echo reply.
@@ -534,4 +584,240 @@ fn no_file_contents_can_bring_the_reader_down() {
     }
 
     assert!(attempts > 300, "only {attempts} files tried");
+}
+
+#[test]
+fn a_capture_file_becomes_a_flow_table() {
+    let client = [192, 168, 1, 15];
+    let server = [142, 250, 184, 14];
+
+    // A three-way handshake plus one data segment each way, from a file.
+    let bytes = build_pcap(
+        1,
+        &[
+            (
+                1_790_005_351,
+                0,
+                ethernet(
+                    0x0800,
+                    &ipv4_between(client, server, 6, &tcp(53_122, 443, 0x02)),
+                ),
+            ),
+            (
+                1_790_005_351,
+                200_000,
+                ethernet(
+                    0x0800,
+                    &ipv4_between(server, client, 6, &tcp(443, 53_122, 0x12)),
+                ),
+            ),
+            (
+                1_790_005_351,
+                400_000,
+                ethernet(
+                    0x0800,
+                    &ipv4_between(client, server, 6, &tcp(53_122, 443, 0x10)),
+                ),
+            ),
+            (
+                1_790_005_353,
+                740_000,
+                ethernet(
+                    0x0800,
+                    &ipv4_between(server, client, 6, &tcp(443, 53_122, 0x18)),
+                ),
+            ),
+        ],
+    );
+    let scratch = Scratch::new("flows-tcp.pcap", &bytes);
+    let table = flows_of(scratch.path(), None);
+
+    assert_eq!(table.len(), 1, "one conversation, four packets");
+    let flows = table.flows_sorted();
+    let flow = flows.first().copied().unwrap_or_else(|| unreachable!());
+
+    assert_eq!(flow.key.protocol, FlowProtocol::Tcp);
+    assert_eq!(flow.total_packets(), 4);
+    // A is 142.250.184.14:443, the lower-sorted endpoint.
+    assert_eq!(flow.key.a.port, 443);
+    assert_eq!(flow.key.b.port, 53_122);
+    assert_eq!(flow.a_to_b.packets, 2, "server to client");
+    assert_eq!(flow.b_to_a.packets, 2, "client to server");
+    assert_eq!(
+        flow.duration(),
+        Some(std::time::Duration::from_micros(2_740_000))
+    );
+
+    let facts = flow.tcp.unwrap_or_default();
+    assert_eq!(facts.b_to_a.syn, 1, "the client sent one SYN");
+    assert_eq!(facts.a_to_b.syn, 1, "the server answered with SYN/ACK");
+    assert_eq!(facts.a_to_b.rst, 0);
+}
+
+#[test]
+fn several_conversations_are_kept_apart_and_ordered() {
+    let client = [192, 168, 1, 15];
+    let bytes = build_pcap(
+        1,
+        &[
+            (
+                1_790_005_353,
+                0,
+                ethernet(
+                    0x0800,
+                    &ipv4_between(client, [1, 1, 1, 1], 6, &tcp(5_002, 443, 0x02)),
+                ),
+            ),
+            (
+                1_790_005_351,
+                0,
+                ethernet(
+                    0x0800,
+                    &ipv4_between(client, [8, 8, 8, 8], 17, &udp_ports(5_000, 53)),
+                ),
+            ),
+            (
+                1_790_005_352,
+                0,
+                ethernet(
+                    0x0800,
+                    &ipv4_between(client, [1, 1, 1, 1], 6, &tcp(5_001, 443, 0x02)),
+                ),
+            ),
+        ],
+    );
+    let scratch = Scratch::new("flows-many.pcap", &bytes);
+    let table = flows_of(scratch.path(), None);
+
+    assert_eq!(table.len(), 3);
+    // Sorted by when each conversation started, not by file order.
+    let starts: Vec<i64> = table
+        .flows_sorted()
+        .iter()
+        .map(|flow| flow.first_seen().seconds())
+        .collect();
+    assert_eq!(starts, vec![1_790_005_351, 1_790_005_352, 1_790_005_353]);
+
+    let protocols: Vec<FlowProtocol> = table
+        .flows_sorted()
+        .iter()
+        .map(|flow| flow.key.protocol)
+        .collect();
+    assert_eq!(
+        protocols,
+        vec![FlowProtocol::Udp, FlowProtocol::Tcp, FlowProtocol::Tcp]
+    );
+}
+
+#[test]
+fn arp_and_icmp_in_a_file_are_counted_but_form_no_flows() {
+    let bytes = build_pcap(
+        1,
+        &[
+            (1_790_005_351, 0, ethernet(0x0806, &arp_request())),
+            (
+                1_790_005_352,
+                0,
+                ethernet(0x0800, &ipv4(1, &icmp_echo_reply())),
+            ),
+            (1_790_005_353, 0, ethernet(0x0800, &ipv4(6, &tcp_syn()))),
+        ],
+    );
+    let scratch = Scratch::new("flows-mixed.pcap", &bytes);
+    let table = flows_of(scratch.path(), None);
+
+    assert_eq!(table.len(), 1, "only the TCP packet is a conversation");
+    let counts = table.untracked();
+    assert_eq!(counts.arp, 1);
+    assert_eq!(counts.icmp, 1);
+    assert_eq!(counts.total(), 2);
+}
+
+#[test]
+fn a_later_fragment_in_a_file_does_not_invent_a_flow() {
+    // A fragment at offset 185 carries no ports. Its first bytes are the middle
+    // of someone else's payload and must not be read as a TCP header.
+    let mut fragment = ipv4_between([192, 168, 1, 15], [1, 1, 1, 1], 6, &[0xaa; 8]);
+    fragment[6] = 0x20; // more fragments ...
+    fragment[7] = 0xb9; // ... at offset 185
+
+    let bytes = build_pcap(1, &[(1_790_005_351, 0, ethernet(0x0800, &fragment))]);
+    let scratch = Scratch::new("flows-fragment.pcap", &bytes);
+    let table = flows_of(scratch.path(), None);
+
+    assert!(table.is_empty());
+    assert_eq!(table.untracked().later_fragments, 1);
+}
+
+#[test]
+fn the_flow_table_survives_a_corrupt_file_tail() {
+    let frame = ethernet(0x0800, &ipv4(6, &tcp_syn()));
+    let len = u32::try_from(frame.len()).unwrap_or(0);
+
+    let mut bytes = pcap_header(1);
+    for seconds in 0..3u32 {
+        bytes.extend_from_slice(&record_header(1_790_005_351 + seconds, 0, len, len));
+        bytes.extend_from_slice(&frame);
+    }
+    bytes.extend_from_slice(&record_header(1_790_005_360, 0, len, len));
+    bytes.extend_from_slice(&frame[..10]);
+
+    let scratch = Scratch::new("flows-cut.pcap", &bytes);
+    let table = flows_of(scratch.path(), None);
+
+    assert_eq!(table.len(), 1);
+    assert_eq!(
+        table
+            .flows_sorted()
+            .first()
+            .map(|flow| flow.total_packets()),
+        Some(3),
+        "the packets before the damage still count"
+    );
+}
+
+#[test]
+fn count_limits_what_the_flow_table_sees() {
+    let client = [192, 168, 1, 15];
+    let packets: Vec<_> = (0..6u16)
+        .map(|index| {
+            (
+                1_790_005_351 + u32::from(index),
+                0,
+                ethernet(
+                    0x0800,
+                    &ipv4_between(client, [1, 1, 1, 1], 6, &tcp(5_000 + index, 443, 0x02)),
+                ),
+            )
+        })
+        .collect();
+    let scratch = Scratch::new("flows-count.pcap", &build_pcap(1, &packets));
+
+    assert_eq!(flows_of(scratch.path(), None).len(), 6);
+    assert_eq!(flows_of(scratch.path(), Some(2)).len(), 2);
+}
+
+#[test]
+fn flow_output_is_byte_identical_between_runs() {
+    let client = [192, 168, 1, 15];
+    let packets: Vec<_> = (0..20u16)
+        .map(|index| {
+            (
+                1_790_005_351,
+                u32::from(index),
+                ethernet(
+                    0x0800,
+                    &ipv4_between(client, [1, 1, 1, 1], 6, &tcp(5_000 + index, 443, 0x02)),
+                ),
+            )
+        })
+        .collect();
+    let scratch = Scratch::new("flows-stable.pcap", &build_pcap(1, &packets));
+
+    // Twenty flows all starting within the same second, so the tie-break is
+    // doing the work. Hash order would differ between runs of the process.
+    let first = netsentry::render::flow_table(&flows_of(scratch.path(), None));
+    let second = netsentry::render::flow_table(&flows_of(scratch.path(), None));
+    assert_eq!(first, second);
+    assert!(first.contains("[*] Flows: 20"));
 }

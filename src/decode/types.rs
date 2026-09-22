@@ -238,6 +238,25 @@ impl TcpFlags {
         self.0 & flag != 0
     }
 
+    /// Whether the SYN bit is set, with or without ACK.
+    ///
+    /// Distinct from [`TcpFlags::is_syn`], which asks the narrower question of
+    /// whether this is a bare connection attempt. Counting connection setup
+    /// wants this one: a SYN/ACK is still a segment carrying SYN.
+    pub fn has_syn(self) -> bool {
+        self.has(Self::SYN)
+    }
+
+    /// Whether the FIN bit is set.
+    pub fn has_fin(self) -> bool {
+        self.has(Self::FIN)
+    }
+
+    /// Whether the ACK bit is set.
+    pub fn has_ack(self) -> bool {
+        self.has(Self::ACK)
+    }
+
     /// SYN without ACK: a connection attempt.
     pub fn is_syn(self) -> bool {
         self.has(Self::SYN) && !self.has(Self::ACK)
@@ -353,6 +372,25 @@ mod tests {
         assert!(TcpFlags(0x012).is_syn_ack());
         assert!(TcpFlags(0x014).is_reset());
         assert!(!TcpFlags(0x010).is_syn());
+    }
+
+    #[test]
+    fn bit_predicates_ask_about_one_bit_each() {
+        // is_syn() is the narrow question; has_syn() is the broad one, and a
+        // SYN/ACK answers them differently.
+        let syn_ack = TcpFlags(0x012);
+        assert!(!syn_ack.is_syn());
+        assert!(syn_ack.has_syn());
+        assert!(syn_ack.has_ack());
+        assert!(!syn_ack.has_fin());
+
+        let fin_ack = TcpFlags(0x011);
+        assert!(fin_ack.has_fin());
+        assert!(fin_ack.has_ack());
+        assert!(!fin_ack.has_syn());
+
+        assert!(TcpFlags(0x004).is_reset());
+        assert!(!TcpFlags(0x000).has_ack());
     }
 
     #[test]

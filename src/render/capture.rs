@@ -16,6 +16,7 @@ pub fn capture_header(
     interface: &NetworkInterface,
     settings: CaptureSettings,
     link_type: &LinkType,
+    flow_mode: bool,
 ) -> String {
     let mut out = String::new();
 
@@ -62,13 +63,27 @@ pub fn capture_header(
         "payload",
         "not captured for display \u{2014} metadata only",
     );
+    if flow_mode {
+        // Flow mode prints nothing per packet, so say up front that the
+        // silence is intentional and when the output will arrive.
+        banner(
+            &mut out,
+            "output",
+            "conversations, summarised when the capture ends",
+        );
+    }
 
     out.push('\n');
     out
 }
 
 /// Renders the banner printed before a capture file is analysed.
-pub fn file_header(path: &Path, link_type: &LinkType, limit: Option<u64>) -> String {
+pub fn file_header(
+    path: &Path,
+    link_type: &LinkType,
+    limit: Option<u64>,
+    flow_mode: bool,
+) -> String {
     let mut out = String::new();
 
     let _ = writeln!(
@@ -99,6 +114,9 @@ pub fn file_header(path: &Path, link_type: &LinkType, limit: Option<u64>) -> Str
         },
     );
     banner(&mut out, "clock", "UTC");
+    if flow_mode {
+        banner(&mut out, "output", "conversations, not individual packets");
+    }
 
     out.push('\n');
     out
@@ -344,7 +362,7 @@ mod tests {
             attributes: vec![],
             addresses: vec![],
         };
-        let header = capture_header(&interface, settings(), &link_type());
+        let header = capture_header(&interface, settings(), &link_type(), false);
 
         assert!(
             header.contains("interface   : eth0  (Intel Wi-Fi 6)"),
@@ -359,6 +377,23 @@ mod tests {
     }
 
     #[test]
+    fn flow_mode_warns_that_packets_will_not_be_printed() {
+        let interface = NetworkInterface {
+            index: 1,
+            name: "eth0".into(),
+            description: None,
+            status: LinkStatus::Running,
+            attributes: vec![],
+            addresses: vec![],
+        };
+        let header = capture_header(&interface, settings(), &link_type(), true);
+        assert!(header.contains("output      : conversations"), "{header}");
+
+        let plain = capture_header(&interface, settings(), &link_type(), false);
+        assert!(!plain.contains("output      :"), "{plain}");
+    }
+
+    #[test]
     fn capture_header_says_ctrl_c_when_there_is_no_limit() {
         let interface = NetworkInterface {
             index: 1,
@@ -369,7 +404,7 @@ mod tests {
             addresses: vec![],
         };
         let unlimited = CaptureSettings::new(1500, false, None).unwrap_or_default();
-        let header = capture_header(&interface, unlimited, &link_type());
+        let header = capture_header(&interface, unlimited, &link_type(), false);
 
         assert!(header.contains("stop after  : Ctrl+C"), "{header}");
         assert!(header.contains("promiscuous : off"));

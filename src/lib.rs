@@ -9,6 +9,7 @@
 //!
 //! ```text
 //! render    presentation, pure string formatting
+//! flow      which conversation each packet belongs to
 //! decode    what the captured bytes mean (pure: bytes in, model out)
 //! capture   where packets come from: interface discovery and live capture
 //! error     the failure vocabulary shared by everything above
@@ -29,6 +30,7 @@ pub mod capture;
 pub mod cli;
 pub mod decode;
 pub mod error;
+pub mod flow;
 pub mod render;
 
 pub use error::{NetSentryError, Result};

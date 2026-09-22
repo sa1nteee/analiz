@@ -7,11 +7,10 @@ between hosts, and explains *why* a piece of traffic looks suspicious. The
 analysis engine is a plain Rust library with no UI dependencies; a desktop front
 end is planned for a later version.
 
-> **Status: v0.3 — under construction.**
+> **Status: v0.4 — under construction.**
 > NetSentry can list capture interfaces, capture live packets, save them to a
-> pcap file and analyse saved captures — all through one decoder. Grouping
-> packets into conversations is v0.4's job; detecting suspicious behaviour is
-> v0.7's.
+> pcap file, analyse saved captures, and group packets into the conversations
+> they belong to. Detecting suspicious behaviour is v0.7's job.
 
 ## Requirements
 
@@ -62,6 +61,8 @@ netsentry capture -i eth0                 # interfaces can be named instead of n
 netsentry capture -i 1 -w session.pcap    # also save the packets to a file
 netsentry read session.pcap               # analyse a saved capture
 netsentry read session.pcap --count 100   # analyse only its first 100 packets
+netsentry read session.pcap --flows       # report conversations, not packets
+netsentry capture -i 1 --count 100 --flows
 netsentry --help
 netsentry capture --help
 netsentry read --help
@@ -312,6 +313,136 @@ The test suite feeds the decoder every prefix and every single-byte corruption
 of its fixtures — 7808 malformed inputs — and asserts only that it returns.
 
 
+## Flow tracking
+
+A capture of a few minutes is tens of thousands of packets and perhaps a few
+dozen conversations. `--flows` reports the conversations.
+
+```text
+$ netsentry read session.pcap --flows
+NetSentry 0.1.0 — offline analysis
+
+[*] file        : session.pcap
+[*] link type   : EN10MB (Ethernet)
+[*] output      : conversations, not individual packets
+
+[*] Analysis finished (capture source ended).
+
+    packets analysed     : 80
+    ...
+
+[*] Flows: 11
+    A is the endpoint on the left of ↔, B the one on the right.
+    The order is fixed by address and port, not by who spoke first.
+
+  TCP 160.79.104.10:443 ↔ 192.0.2.2:50366
+      packets 18      bytes 10.0 KB    duration 0.22s
+      A→B 8 / 4948 B       B→A 10 / 5078 B
+      TCP A→B [SYN,PSH,ACK] syn 1 fin 0 rst 0   B→A [SYN,PSH,ACK] syn 1 fin 0 rst 0
+
+  UDP 8.8.8.8:53 ↔ 192.0.2.2:39383
+      packets 2       bytes 198 B      duration 0.01s
+      A→B 1 / 127 B        B→A 1 / 71 B
+
+    3 packets formed no flow: 2 ARP, 1 ICMP.
+```
+
+### What a flow is
+
+A flow is one conversation, identified by the classic **5-tuple**: the two IP
+addresses, the two ports and the transport protocol.
+
+The catch is that a conversation arrives as packets going *both ways*, and
+
+```text
+192.168.1.10:50000 → 1.1.1.1:443
+1.1.1.1:443        → 192.168.1.10:50000
+```
+
+are the same conversation. Filing them as two flows would be the opposite of
+what a flow is for. So NetSentry sorts the two endpoints into a fixed order and
+calls the lower one **A** and the higher one **B**.
+
+That means **A is not "the client" and B is not "the server"** — A is simply the
+endpoint that sorts first by address and then by port. The benefit is that the
+identity of a flow does not depend on which packet happened to be seen first:
+the same capture read twice, or read backwards, produces the same flows with the
+same A and the same B.
+
+Which way a given packet was actually travelling is not lost. It is what the
+`A→B` and `B→A` counters are keyed on, and the asymmetry between them is often
+the interesting part — a client sending 4 KB and receiving 52 KB looks very
+different from one sending 52 KB and receiving 4 KB.
+
+### What forms a flow
+
+| Traffic | Flow? | Why |
+| ------- | ----- | --- |
+| TCP | yes | has ports |
+| UDP | yes | has ports |
+| ICMP / ICMPv6 | no | no ports; see below |
+| ARP | no | not IP at all |
+| Non-initial IP fragment | no | its ports are in a different packet |
+| Truncated or undecoded packet | no | nothing to key on |
+
+ICMP has no ports, so an ICMP flow could only be keyed on the host pair — which
+would pour an echo request, a "host unreachable" about some third connection and
+a traceroute probe into one bucket, none of them a conversation with the others.
+Most interesting ICMP messages also *quote* a different packet, so the
+conversation they concern is not the one their own headers describe. Correlating
+that quoted header with an existing flow is real work, and it belongs with the
+detection rules of v0.7 rather than here.
+
+Nothing is dropped: everything still decodes and prints in packet mode, and the
+flow summary says how many packets it left out and why.
+
+### Byte accounting
+
+`bytes` is **wire bytes** — what the packets were on the network. When a small
+`--snaplen` truncated them, the captured total differs and the flow says so:
+
+```text
+      captured 64 B of 1514 B on the wire (snapshot length truncated these packets)
+```
+
+Sizes below 10 000 bytes are printed exactly; above that they are rounded to one
+decimal in decimal units (1 KB = 1000 bytes).
+
+### Duration
+
+`duration` is the **latest minus the earliest** timestamp on the flow's packets,
+not last-arrival minus first-arrival. Capture files are not required to be in
+timestamp order and real ones sometimes are not, so taking the ends of the range
+keeps a duration from coming out negative. A flow whose timestamps are not
+points in time at all reports its duration as `unknown` rather than inventing
+one.
+
+### Flow limit
+
+The table holds at most **100 000** conversations by default, about 50 MB. The
+bound exists because the input is not trusted: a crafted capture can name a
+million distinct endpoints as cheaply as one.
+
+Reaching it is a degradation, not an error. Conversations already being tracked
+keep being counted, the analysis finishes normally, and the summary says what
+was missed:
+
+```text
+    66 packets formed no flow: 66 over the flow limit.
+    The flow limit of 3 was reached. Raise it with --max-flows.
+```
+
+`--max-flows N` raises or lowers it.
+
+### Why `--flows` replaces the packet list
+
+Printing 80 000 packet lines *and* a flow table would bury the summary under the
+thing it summarises, and nobody scrolls back that far. `--flows` is therefore a
+mode, not an addition: it reports conversations instead of packets. Run without
+it to see packets. This keeps one flag where two would otherwise be needed, and
+leaves no combination whose meaning has to be guessed at.
+
+
 ## Privileges
 
 Listing interfaces generally works as a normal user. **Capturing packets does
@@ -369,6 +500,9 @@ The project is a single crate split into a library and a thin binary:
 | `src/decode/net.rs`        | IPv4, IPv6 and ARP decoding.                          |
 | `src/decode/transport.rs`  | TCP, UDP and ICMP decoding.                           |
 | `src/decode/model.rs`      | The decoded-packet domain model.                      |
+| `src/flow/key.rs`          | Flow identity and its canonical endpoint order.       |
+| `src/flow/stats.rs`        | What a flow accumulates.                              |
+| `src/flow/mod.rs`          | The flow table, its limit and what it left out.       |
 | `src/render/`              | Pure terminal formatting. No I/O.                     |
 
 Layer dependencies point one way only — `render` above `decode` above
@@ -379,9 +513,13 @@ A live interface and a capture file share one pipeline:
 
 ```text
 interface ─┐
-           ├─→ pump ─→ decode ─→ domain model ─→ render
-pcap file ─┘
+           ├─→ pump ─→ decode ─→ domain model ─┬─→ render
+pcap file ─┘                                   └─→ flow tracking ─→ render
 ```
+
+The flow tracker takes decoded packets, never bytes: it computes no offsets and
+parses no headers, so the decoder stays the single source of truth about what a
+packet contains.
 
 There is no `PacketSource` trait, deliberately. The `pcap` crate already has
 one: `Capture<Active>` and `Capture<Offline>` both implement `pcap::Activated`,
@@ -420,6 +558,24 @@ arrays, and why it is ready to be pointed at `cargo-fuzz` unchanged.
 * **MACsec and 802.3 LLC/SNAP frames are not decoded.** An EtherType below
   0x0600 is an 802.3 length field, which NetSentry reports as such rather than
   misreading as a protocol.
+
+### Flow tracking
+
+* **Retransmissions are counted twice.** A TCP segment that appears in the
+  capture twice is two packets, because telling a retransmission from a
+  duplicate needs sequence-number tracking, which this version does not do.
+* **Fragments are not correlated.** The first fragment of a packet carries its
+  transport header and joins its flow normally; later fragments do not, and are
+  counted as untrackable rather than guessed into a flow. Reassembly is not
+  attempted.
+* **There is no connection state.** TCP flags are counted and OR-ed together;
+  no state machine decides whether a connection was established, half-open or
+  reset. `syn 1` means one segment carried SYN, nothing more.
+* **Flows never expire.** A conversation stays in the table for the whole run.
+  There is no idle timeout and no LRU eviction — only the flow limit, and
+  reaching it stops *new* flows rather than evicting old ones.
+* **ICMP and ARP form no flows**, by the reasoning above.
+* **`--flows` and the packet list are exclusive.** By design; see above.
 
 ### Capture and capture files
 

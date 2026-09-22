@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::capture::settings::{DEFAULT_SNAPLEN, MAX_SNAPLEN, MIN_SNAPLEN};
+use crate::flow::DEFAULT_MAX_FLOWS;
 
 /// Top level NetSentry command.
 #[derive(Debug, Parser)]
@@ -89,6 +90,47 @@ pub struct ReadArgs {
                      than what the file contains."
     )]
     pub count: Option<u64>,
+
+    /// How to report what was read.
+    #[command(flatten)]
+    pub flow: FlowArgs,
+}
+
+/// Options shared by every command that can group packets into conversations.
+#[derive(Debug, Args)]
+pub struct FlowArgs {
+    /// Group packets into conversations instead of listing them
+    #[arg(
+        long,
+        long_help = "Report conversations rather than packets.\n\n\
+                     Packets are grouped by their 5-tuple -- the two addresses, the two\n\
+                     ports and the protocol -- with both directions of a conversation\n\
+                     kept together and counted separately. The flow table is printed\n\
+                     when the capture ends.\n\n\
+                     This REPLACES the per-packet output rather than adding to it. The\n\
+                     point of flows is that a capture has far more packets than\n\
+                     conversations; printing both would bury the summary under the\n\
+                     thing it summarises.\n\n\
+                     Only TCP and UDP form flows. ARP and ICMP have no ports to key a\n\
+                     conversation on; they are still counted, and the summary says how\n\
+                     many were left out."
+    )]
+    pub flows: bool,
+
+    /// Most conversations to track at once
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_MAX_FLOWS,
+        requires = "flows",
+        long_help = "How many conversations to track before refusing to start new ones.\n\n\
+                     The table is bounded because its input is not trusted: a crafted\n\
+                     capture can name a million distinct endpoints as cheaply as one.\n\
+                     Reaching the limit is not an error -- conversations already being\n\
+                     tracked keep being counted, and the summary reports how many new\n\
+                     ones were skipped."
+    )]
+    pub max_flows: usize,
 }
 
 /// Options for the `capture` command.
@@ -143,6 +185,10 @@ pub struct CaptureArgs {
     /// Replace the --write file if it already exists
     #[arg(long, requires = "write")]
     pub overwrite: bool,
+
+    /// How to report what was captured.
+    #[command(flatten)]
+    pub flow: FlowArgs,
 }
 
 /// Builds the `--snaplen` long help from the library's own bounds, so the two
@@ -349,6 +395,66 @@ mod tests {
                 "-w",
                 "out.pcap",
                 "--overwrite"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn flows_are_off_unless_asked_for() {
+        let parsed = Cli::try_parse_from(["netsentry", "read", "a.pcap"]);
+        match parsed.map(|cli| cli.command) {
+            Ok(Command::Read(args)) => {
+                assert!(!args.flow.flows);
+                assert_eq!(args.flow.max_flows, DEFAULT_MAX_FLOWS);
+            }
+            other => panic!("did not parse: {other:?}"),
+        }
+
+        let parsed = Cli::try_parse_from(["netsentry", "capture", "-i", "1"]);
+        match parsed.map(|cli| cli.command) {
+            Ok(Command::Capture(args)) => assert!(!args.flow.flows),
+            other => panic!("did not parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_commands_accept_flow_options() {
+        let read = Cli::try_parse_from([
+            "netsentry",
+            "read",
+            "a.pcap",
+            "--flows",
+            "--max-flows",
+            "500",
+        ]);
+        match read.map(|cli| cli.command) {
+            Ok(Command::Read(args)) => {
+                assert!(args.flow.flows);
+                assert_eq!(args.flow.max_flows, 500);
+            }
+            other => panic!("did not parse: {other:?}"),
+        }
+
+        let capture = Cli::try_parse_from(["netsentry", "capture", "-i", "1", "--flows"]);
+        match capture.map(|cli| cli.command) {
+            Ok(Command::Capture(args)) => assert!(args.flow.flows),
+            other => panic!("did not parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_flows_is_meaningless_without_flows() {
+        // Another option that would silently do nothing if it were allowed.
+        assert!(Cli::try_parse_from(["netsentry", "read", "a.pcap", "--max-flows", "10"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "netsentry",
+                "read",
+                "a.pcap",
+                "--flows",
+                "--max-flows",
+                "10"
             ])
             .is_ok()
         );

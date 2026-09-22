@@ -13,6 +13,7 @@ use netsentry::capture::{self, CaptureFile, CaptureSettings, LiveCapture};
 use netsentry::cli::{CaptureArgs, Cli, Command, ReadArgs};
 use netsentry::decode::{self, LinkLayer};
 use netsentry::error::NetSentryError;
+use netsentry::flow::FlowTable;
 use netsentry::render;
 
 fn main() -> ExitCode {
@@ -61,7 +62,7 @@ fn run_capture(args: &CaptureArgs) -> netsentry::Result<()> {
     let mut session = LiveCapture::open(interface, &settings)?;
     print!(
         "{}",
-        render::capture_header(interface, settings, session.link_type())
+        render::capture_header(interface, settings, session.link_type(), args.flow.flows)
     );
 
     let mut writer = match &args.write {
@@ -82,14 +83,31 @@ fn run_capture(args: &CaptureArgs) -> netsentry::Result<()> {
     let mut out = stdout.lock();
 
     let link_layer = LinkLayer::from_dlt(session.link_type().code);
+    let mut flows = args
+        .flow
+        .flows
+        .then(|| FlowTable::with_limit(args.flow.max_flows));
+
     // The writer is handed to the pump, which copies each packet as the driver
     // delivered it; this closure only ever sees metadata and bytes.
     let summary = session.run(writer.as_mut(), |metadata, bytes| {
         let decoded = decode::decode(link_layer, bytes);
-        writeln!(out, "{}", render::packet_line(metadata, &decoded))
+        match flows.as_mut() {
+            // Flow mode replaces the packet list rather than adding to it: a
+            // capture has far more packets than conversations, and printing
+            // both would bury the summary under the thing it summarises.
+            Some(table) => {
+                table.record(metadata, &decoded);
+                Ok(())
+            }
+            None => writeln!(out, "{}", render::packet_line(metadata, &decoded)),
+        }
     })?;
 
     print!("{}", render::capture_summary(&summary));
+    if let Some(table) = &flows {
+        print!("{}", render::flow_table(table));
+    }
 
     if let Some(writer) = writer.as_mut() {
         writer.flush()?;
@@ -106,19 +124,33 @@ fn run_read(args: &ReadArgs) -> netsentry::Result<()> {
     let mut file = CaptureFile::open(&args.file)?;
     print!(
         "{}",
-        render::file_header(file.path(), file.link_type(), args.count)
+        render::file_header(file.path(), file.link_type(), args.count, args.flow.flows)
     );
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
     let link_layer = LinkLayer::from_dlt(file.link_type().code);
+    let mut flows = args
+        .flow
+        .flows
+        .then(|| FlowTable::with_limit(args.flow.max_flows));
+
     let summary = file.run(args.count, |metadata, bytes| {
         let decoded = decode::decode(link_layer, bytes);
-        writeln!(out, "{}", render::packet_line(metadata, &decoded))
+        match flows.as_mut() {
+            Some(table) => {
+                table.record(metadata, &decoded);
+                Ok(())
+            }
+            None => writeln!(out, "{}", render::packet_line(metadata, &decoded)),
+        }
     });
 
     print!("{}", render::file_summary(&summary));
+    if let Some(table) = &flows {
+        print!("{}", render::flow_table(table));
+    }
 
     // A corrupt tail is reported after the packets that were readable, and
     // still sets a failing exit code so a script notices.
